@@ -245,3 +245,5 @@ internal sealed record R2Settings(
     string ObjectPrefix
 );
 
+public partial class Program;
+
