@@ -1,5 +1,6 @@
 using Amazon.S3;
 using Amazon.S3.Model;
+using System.Diagnostics.CodeAnalysis;
 using Telegram.Bot;
 using Telegram.Bot.Types;
 
@@ -24,49 +25,35 @@ app.MapPost("/telegram/hook", async Task<IResult> (HttpRequest req, Update updat
     if (message is null || chatId is null || message.From is null)
         return Results.Ok();
 
-    if (settings.AllowedUserId is not null && message.From.Id != settings.AllowedUserId.Value)
+    if (settings.AllowedUserIds is not null && !settings.AllowedUserIds.Contains(message.From.Id))
         return Results.Ok();
 
-    if (message.Document is null)
+    if (!TryGetSupportedUpload(message, out var upload, out var rejectionMessage))
     {
-        if (message.Photo?.Any() == true)
+        if (!string.IsNullOrWhiteSpace(rejectionMessage))
         {
             await bot.SendMessage(
                 chatId.Value,
-                "Please send screenshots as PNG files (document upload), not as photos.",
+                rejectionMessage,
                 cancellationToken: cancellationToken
             );
         }
 
-        return Results.Ok();
-    }
-
-    if (!LooksLikePng(message.Document))
-    {
-        await bot.SendMessage(
-            chatId.Value,
-            "Only PNG files are accepted.",
-            cancellationToken: cancellationToken
-        );
         return Results.Ok();
     }
 
     try
     {
-        await using var imageStream = await DownloadFileAsync(bot, message.Document.FileId, cancellationToken);
-
-        if (!HasPngSignature(imageStream))
-        {
-            await bot.SendMessage(
-                chatId.Value,
-                "The uploaded file is not a valid PNG.",
-                cancellationToken: cancellationToken
-            );
-            return Results.Ok();
-        }
-
-        var objectKey = BuildObjectKey(settings.R2.ObjectPrefix, message.From.Id, message.Document.FileName);
-        await UploadToR2Async(s3, settings.R2.BucketName, objectKey, imageStream, cancellationToken);
+        await using var mediaStream = await DownloadFileAsync(bot, upload.FileId, cancellationToken);
+        var objectKey = BuildObjectKey(
+            settings.R2.ObjectPrefix,
+            message.From.Id,
+            upload.Category,
+            upload.FileName,
+            upload.FallbackBaseName,
+            upload.Extension
+        );
+        await UploadToR2Async(s3, settings.R2.BucketName, objectKey, upload.ContentType, mediaStream, cancellationToken);
 
         await bot.SendMessage(
             chatId.Value,
@@ -93,16 +80,7 @@ static BotSettings LoadSettings(IConfiguration configuration)
 {
     var botToken = RequireSetting(configuration, "TELEGRAM_BOT_TOKEN");
     var webhookSecret = configuration["TELEGRAM_WEBHOOK_SECRET"];
-    var allowedUserIdRaw = configuration["TELEGRAM_ALLOWED_USER_ID"];
-    long? allowedUserId = null;
-
-    if (!string.IsNullOrWhiteSpace(allowedUserIdRaw))
-    {
-        if (!long.TryParse(allowedUserIdRaw, out var parsedUserId))
-            throw new InvalidOperationException("TELEGRAM_ALLOWED_USER_ID must be a valid integer.");
-
-        allowedUserId = parsedUserId;
-    }
+    var allowedUserIds = ParseAllowedUserIds(configuration);
 
     var r2 = new R2Settings(
         Endpoint: RequireSetting(configuration, "R2_ENDPOINT"),
@@ -112,7 +90,7 @@ static BotSettings LoadSettings(IConfiguration configuration)
         ObjectPrefix: configuration["R2_OBJECT_PREFIX"] ?? "screenshots"
     );
 
-    return new BotSettings(botToken, webhookSecret, allowedUserId, r2);
+    return new BotSettings(botToken, webhookSecret, allowedUserIds, r2);
 }
 
 static string RequireSetting(IConfiguration configuration, string key)
@@ -145,11 +123,36 @@ static IAmazonS3 CreateS3Client(R2Settings settings)
     return new AmazonS3Client(settings.AccessKeyId, settings.SecretAccessKey, config);
 }
 
-static bool LooksLikePng(Document document)
+static HashSet<long>? ParseAllowedUserIds(IConfiguration configuration)
 {
-    var hasPngMimeType = string.Equals(document.MimeType, "image/png", StringComparison.OrdinalIgnoreCase);
-    var hasPngExtension = document.FileName?.EndsWith(".png", StringComparison.OrdinalIgnoreCase) ?? false;
-    return hasPngMimeType || hasPngExtension;
+    var rawValues = new List<string>();
+
+    var allowedUserIdsRaw = configuration["TELEGRAM_ALLOWED_USER_IDS"];
+    if (!string.IsNullOrWhiteSpace(allowedUserIdsRaw))
+    {
+        rawValues.AddRange(allowedUserIdsRaw.Split(
+            [',', ';', ' ', '\r', '\n', '\t'],
+            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries
+        ));
+    }
+
+    var singleAllowedUserId = configuration["TELEGRAM_ALLOWED_USER_ID"];
+    if (!string.IsNullOrWhiteSpace(singleAllowedUserId))
+        rawValues.Add(singleAllowedUserId.Trim());
+
+    if (rawValues.Count == 0)
+        return null;
+
+    var parsedIds = new HashSet<long>();
+    foreach (var rawValue in rawValues)
+    {
+        if (!long.TryParse(rawValue, out var parsedId))
+            throw new InvalidOperationException("TELEGRAM_ALLOWED_USER_IDS and TELEGRAM_ALLOWED_USER_ID must contain valid integers.");
+
+        parsedIds.Add(parsedId);
+    }
+
+    return parsedIds;
 }
 
 static async Task<MemoryStream> DownloadFileAsync(ITelegramBotClient bot, string fileId, CancellationToken cancellationToken)
@@ -164,53 +167,258 @@ static async Task<MemoryStream> DownloadFileAsync(ITelegramBotClient bot, string
     return stream;
 }
 
-static bool HasPngSignature(MemoryStream stream)
+static bool TryGetSupportedUpload(Message message, [NotNullWhen(true)] out IncomingUpload? upload, out string? rejectionMessage)
 {
-    var signature = new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 };
+    upload = null;
+    rejectionMessage = null;
 
-    if (stream.Length < signature.Length)
+    if (message.Video is not null)
     {
-        stream.Position = 0;
-        return false;
+        upload = CreateUploadFromVideo(message.Video);
+        return true;
     }
 
-    var header = new byte[signature.Length];
-    var bytesRead = stream.Read(header, 0, header.Length);
-    stream.Position = 0;
-
-    if (bytesRead != signature.Length)
-        return false;
-
-    for (var i = 0; i < signature.Length; i++)
+    if (message.Photo?.Any() == true)
     {
-        if (header[i] != signature[i])
-            return false;
+        upload = CreateUploadFromPhoto(message.Photo);
+        return true;
     }
 
-    return true;
+    if (message.Document is null)
+        return false;
+
+    if (TryCreateUploadFromDocument(message.Document, out upload))
+        return true;
+
+    rejectionMessage = "Only image and video files are accepted.";
+    return false;
 }
 
-static string BuildObjectKey(string objectPrefix, long userId, string? originalFileName)
+static IncomingUpload CreateUploadFromPhoto(IEnumerable<PhotoSize> photoSizes)
+{
+    var preferredPhoto = photoSizes
+        .OrderByDescending(photo => photo.FileSize ?? 0)
+        .ThenByDescending(photo => photo.Width * photo.Height)
+        .First();
+
+    return new IncomingUpload(
+        FileId: preferredPhoto.FileId,
+        FileName: null,
+        ContentType: "image/jpeg",
+        Extension: ".jpg",
+        FallbackBaseName: "photo",
+        Category: "images"
+    );
+}
+
+static IncomingUpload CreateUploadFromVideo(Video video)
+{
+    var extension = ResolveExtension(video.FileName, video.MimeType, ".mp4");
+    var contentType = ResolveContentType(video.MimeType, extension, "video/mp4");
+
+    return new IncomingUpload(
+        FileId: video.FileId,
+        FileName: video.FileName,
+        ContentType: contentType,
+        Extension: extension,
+        FallbackBaseName: "video",
+        Category: "videos"
+    );
+}
+
+static bool TryCreateUploadFromDocument(Document document, [NotNullWhen(true)] out IncomingUpload? upload)
+{
+    upload = null;
+    var fileExtension = Path.GetExtension(document.FileName ?? string.Empty);
+
+    if (LooksLikeImage(document.MimeType, fileExtension))
+    {
+        var extension = ResolveExtension(document.FileName, document.MimeType, ".jpg");
+        var contentType = ResolveContentType(document.MimeType, extension, "image/jpeg");
+        upload = new IncomingUpload(
+            FileId: document.FileId,
+            FileName: document.FileName,
+            ContentType: contentType,
+            Extension: extension,
+            FallbackBaseName: "image",
+            Category: "images"
+        );
+        return true;
+    }
+
+    if (LooksLikeVideo(document.MimeType, fileExtension))
+    {
+        var extension = ResolveExtension(document.FileName, document.MimeType, ".mp4");
+        var contentType = ResolveContentType(document.MimeType, extension, "video/mp4");
+        upload = new IncomingUpload(
+            FileId: document.FileId,
+            FileName: document.FileName,
+            ContentType: contentType,
+            Extension: extension,
+            FallbackBaseName: "video",
+            Category: "videos"
+        );
+        return true;
+    }
+
+    return false;
+}
+
+static bool LooksLikeImage(string? mimeType, string? extension)
+{
+    if (!string.IsNullOrWhiteSpace(mimeType)
+        && mimeType.StartsWith("image/", StringComparison.OrdinalIgnoreCase))
+    {
+        return true;
+    }
+
+    return IsKnownImageExtension(extension);
+}
+
+static bool LooksLikeVideo(string? mimeType, string? extension)
+{
+    if (!string.IsNullOrWhiteSpace(mimeType)
+        && mimeType.StartsWith("video/", StringComparison.OrdinalIgnoreCase))
+    {
+        return true;
+    }
+
+    return IsKnownVideoExtension(extension);
+}
+
+static bool IsKnownImageExtension(string? extension)
+{
+    return NormalizeExtension(extension) switch
+    {
+        ".png" or ".jpg" or ".jpeg" or ".webp" or ".gif" or ".bmp" or ".tif" or ".tiff" or ".heic" or ".heif" => true,
+        _ => false
+    };
+}
+
+static bool IsKnownVideoExtension(string? extension)
+{
+    return NormalizeExtension(extension) switch
+    {
+        ".mp4" or ".mov" or ".m4v" or ".webm" or ".mkv" or ".avi" or ".3gp" => true,
+        _ => false
+    };
+}
+
+static string ResolveExtension(string? fileName, string? mimeType, string fallbackExtension)
+{
+    var fromFileName = NormalizeExtension(Path.GetExtension(fileName ?? string.Empty));
+    if (!string.IsNullOrWhiteSpace(fromFileName))
+        return fromFileName;
+
+    var fromMimeType = ExtensionFromMimeType(mimeType);
+    if (!string.IsNullOrWhiteSpace(fromMimeType))
+        return fromMimeType;
+
+    return NormalizeExtension(fallbackExtension) ?? ".bin";
+}
+
+static string ResolveContentType(string? mimeType, string extension, string fallbackContentType)
+{
+    if (!string.IsNullOrWhiteSpace(mimeType))
+        return mimeType;
+
+    return ContentTypeFromExtension(extension) ?? fallbackContentType;
+}
+
+static string? NormalizeExtension(string? extension)
+{
+    if (string.IsNullOrWhiteSpace(extension))
+        return null;
+
+    var raw = extension.Trim();
+    if (raw.StartsWith('.'))
+        raw = raw[1..];
+
+    raw = string.Concat(raw.Where(char.IsLetterOrDigit)).ToLowerInvariant();
+    if (string.IsNullOrWhiteSpace(raw))
+        return null;
+
+    return $".{raw}";
+}
+
+static string? ExtensionFromMimeType(string? mimeType)
+{
+    return mimeType?.Trim().ToLowerInvariant() switch
+    {
+        "image/png" => ".png",
+        "image/jpeg" => ".jpg",
+        "image/webp" => ".webp",
+        "image/gif" => ".gif",
+        "image/bmp" => ".bmp",
+        "image/tiff" => ".tiff",
+        "image/heic" => ".heic",
+        "image/heif" => ".heif",
+        "video/mp4" => ".mp4",
+        "video/quicktime" => ".mov",
+        "video/webm" => ".webm",
+        "video/x-matroska" => ".mkv",
+        "video/3gpp" => ".3gp",
+        _ => null
+    };
+}
+
+static string? ContentTypeFromExtension(string extension)
+{
+    return NormalizeExtension(extension) switch
+    {
+        ".png" => "image/png",
+        ".jpg" or ".jpeg" => "image/jpeg",
+        ".webp" => "image/webp",
+        ".gif" => "image/gif",
+        ".bmp" => "image/bmp",
+        ".tif" or ".tiff" => "image/tiff",
+        ".heic" => "image/heic",
+        ".heif" => "image/heif",
+        ".mp4" => "video/mp4",
+        ".mov" => "video/quicktime",
+        ".m4v" => "video/x-m4v",
+        ".webm" => "video/webm",
+        ".mkv" => "video/x-matroska",
+        ".avi" => "video/x-msvideo",
+        ".3gp" => "video/3gpp",
+        _ => null
+    };
+}
+
+static string BuildObjectKey(
+    string objectPrefix,
+    long userId,
+    string category,
+    string? originalFileName,
+    string fallbackBaseName,
+    string extension)
 {
     var safePrefix = string.IsNullOrWhiteSpace(objectPrefix) ? "screenshots" : objectPrefix.Trim().Trim('/');
+    var safeCategory = string.Concat(category.Where(ch => char.IsLetterOrDigit(ch) || ch == '-' || ch == '_'));
+    if (string.IsNullOrWhiteSpace(safeCategory))
+        safeCategory = "files";
+
     var timestamp = DateTimeOffset.UtcNow.ToString("yyyyMMdd-HHmmssfff");
     var randomSuffix = Guid.NewGuid().ToString("N")[..8];
 
-    var originalName = Path.GetFileNameWithoutExtension(originalFileName ?? "screenshot");
+    var originalName = Path.GetFileNameWithoutExtension(originalFileName ?? fallbackBaseName);
     if (string.IsNullOrWhiteSpace(originalName))
-        originalName = "screenshot";
+        originalName = fallbackBaseName;
 
     var safeName = string.Concat(originalName.Where(ch => char.IsLetterOrDigit(ch) || ch == '-' || ch == '_'));
     if (string.IsNullOrWhiteSpace(safeName))
-        safeName = "screenshot";
+        safeName = fallbackBaseName;
 
-    return $"{safePrefix}/{userId}/{timestamp}-{safeName}-{randomSuffix}.png";
+    var safeExtension = NormalizeExtension(extension) ?? ".bin";
+
+    return $"{safePrefix}/{userId}/{safeCategory}/{timestamp}-{safeName}-{randomSuffix}{safeExtension}";
 }
 
 static async Task UploadToR2Async(
     IAmazonS3 s3,
     string bucketName,
     string objectKey,
+    string contentType,
     MemoryStream stream,
     CancellationToken cancellationToken)
 {
@@ -220,7 +428,7 @@ static async Task UploadToR2Async(
         BucketName = bucketName,
         Key = objectKey,
         InputStream = stream,
-        ContentType = "image/png",
+        ContentType = contentType,
         AutoCloseStream = false,
         // Cloudflare R2 does not support AWS streaming payload trailers.
         UseChunkEncoding = false,
@@ -233,7 +441,7 @@ static async Task UploadToR2Async(
 internal sealed record BotSettings(
     string BotToken,
     string? WebhookSecret,
-    long? AllowedUserId,
+    IReadOnlySet<long>? AllowedUserIds,
     R2Settings R2
 );
 
@@ -243,6 +451,15 @@ internal sealed record R2Settings(
     string SecretAccessKey,
     string BucketName,
     string ObjectPrefix
+);
+
+internal sealed record IncomingUpload(
+    string FileId,
+    string? FileName,
+    string ContentType,
+    string Extension,
+    string FallbackBaseName,
+    string Category
 );
 
 public partial class Program;
