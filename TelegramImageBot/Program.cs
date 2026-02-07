@@ -221,7 +221,10 @@ static async Task UploadToR2Async(
         Key = objectKey,
         InputStream = stream,
         ContentType = "image/png",
-        AutoCloseStream = false
+        AutoCloseStream = false,
+        // Cloudflare R2 does not support AWS streaming payload trailers.
+        UseChunkEncoding = false,
+        DisablePayloadSigning = true
     };
 
     await s3.PutObjectAsync(request, cancellationToken);
@@ -241,3 +244,4 @@ internal sealed record R2Settings(
     string BucketName,
     string ObjectPrefix
 );
+
