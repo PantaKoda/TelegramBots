@@ -87,7 +87,7 @@ static BotSettings LoadSettings(IConfiguration configuration)
         AccessKeyId: RequireSetting(configuration, "R2_ACCESS_KEY_ID"),
         SecretAccessKey: RequireSetting(configuration, "R2_SECRET_ACCESS_KEY"),
         BucketName: RequireSetting(configuration, "R2_BUCKET_NAME"),
-        ObjectPrefix: configuration["R2_OBJECT_PREFIX"] ?? "screenshots"
+        ObjectPrefix: configuration["R2_OBJECT_PREFIX"] ?? "family-media"
     );
 
     return new BotSettings(botToken, webhookSecret, allowedUserIds, r2);
@@ -393,7 +393,7 @@ static string BuildObjectKey(
     string fallbackBaseName,
     string extension)
 {
-    var safePrefix = string.IsNullOrWhiteSpace(objectPrefix) ? "screenshots" : objectPrefix.Trim().Trim('/');
+    var safePrefix = string.IsNullOrWhiteSpace(objectPrefix) ? "family-media" : objectPrefix.Trim().Trim('/');
     var safeCategory = string.Concat(category.Where(ch => char.IsLetterOrDigit(ch) || ch == '-' || ch == '_'));
     if (string.IsNullOrWhiteSpace(safeCategory))
         safeCategory = "files";
