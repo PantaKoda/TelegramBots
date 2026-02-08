@@ -1,5 +1,6 @@
 using Amazon.S3;
 using Amazon.S3.Model;
+using Npgsql;
 using TelegramImageBot.Data;
 using Telegram.Bot;
 using Telegram.Bot.Types;
@@ -8,11 +9,29 @@ var builder = WebApplication.CreateBuilder(args);
 
 var settings = LoadSettings(builder.Configuration);
 var postgresEnabled = builder.Services.AddSchedulePersistence(builder.Configuration);
+var databaseTarget = ResolveDatabaseTarget(builder.Configuration);
 var bot = new TelegramBotClient(settings.BotToken);
 var s3 = CreateS3Client(settings.R2);
 
 var app = builder.Build();
 var logger = app.Logger;
+
+if (databaseTarget is not null)
+{
+    logger.LogInformation(
+        "Database connection source {Source}: Host={Host};Port={Port};Database={Database};Username={Username}",
+        databaseTarget.Source,
+        databaseTarget.Host,
+        databaseTarget.Port,
+        databaseTarget.Database,
+        databaseTarget.Username
+    );
+}
+else
+{
+    logger.LogInformation(
+        "No PostgreSQL connection string detected in ConnectionStrings:Postgres, DATABASE_URL, or POSTGRES_CONNECTION_STRING.");
+}
 
 app.MapGet("/", () => Results.Ok("Telegram image bot is running."));
 app.MapGet("/health/db", async Task<IResult> (IServiceProvider services, CancellationToken cancellationToken) =>
@@ -63,10 +82,66 @@ app.MapPost("/telegram/hook", async Task<IResult> (
 
     if (message.Document is null)
     {
+        if (IsStartSessionCommand(message.Text))
+        {
+            if (!captureSessionsEnabled)
+            {
+                logger.LogWarning("User {UserId} requested /start_session while capture sessions are disabled.", message.From.Id);
+                await bot.SendMessage(
+                    chatId.Value,
+                    "Capture sessions are unavailable. Configure PostgreSQL and DATABASE_URL first.",
+                    cancellationToken: cancellationToken
+                );
+                return Results.Ok();
+            }
+
+            var existingSession = await captureSessionRepository!.GetOpenForUserAsync(message.From.Id, cancellationToken);
+            if (existingSession is not null)
+            {
+                logger.LogInformation(
+                    "User {UserId} requested /start_session but session {SessionId} is already open.",
+                    message.From.Id,
+                    existingSession.Id);
+                await bot.SendMessage(
+                    chatId.Value,
+                    $"A session is already open: {existingSession.Id}. Upload PNG documents, then send /close when done.",
+                    cancellationToken: cancellationToken
+                );
+                return Results.Ok();
+            }
+
+            CaptureSessionRecord startedSession;
+            try
+            {
+                startedSession = await captureSessionRepository.CreateAsync(message.From.Id, cancellationToken);
+                logger.LogInformation("Opened capture session {SessionId} for user {UserId} via /start_session.",
+                    startedSession.Id,
+                    message.From.Id);
+            }
+            catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UniqueViolation)
+            {
+                startedSession = await captureSessionRepository.GetOpenForUserAsync(message.From.Id, cancellationToken)
+                    ?? throw new InvalidOperationException(
+                        $"Failed to resolve open capture session after unique violation for user {message.From.Id}.");
+                logger.LogInformation(
+                    "Recovered existing open capture session {SessionId} for user {UserId} after unique violation.",
+                    startedSession.Id,
+                    message.From.Id);
+            }
+
+            await bot.SendMessage(
+                chatId.Value,
+                $"Opened session {startedSession.Id}. Upload PNG documents and send /close when done.",
+                cancellationToken: cancellationToken
+            );
+            return Results.Ok();
+        }
+
         if (IsCloseSessionCommand(message.Text))
         {
             if (!captureSessionsEnabled)
             {
+                logger.LogWarning("User {UserId} requested close command while capture sessions are disabled.", message.From.Id);
                 await bot.SendMessage(
                     chatId.Value,
                     "Capture sessions are unavailable. Configure PostgreSQL and DATABASE_URL first.",
@@ -78,6 +153,7 @@ app.MapPost("/telegram/hook", async Task<IResult> (
             var closedSession = await captureSessionRepository!.CloseOpenForUserAsync(message.From.Id, cancellationToken);
             if (closedSession is null)
             {
+                logger.LogInformation("User {UserId} requested close command but had no open session.", message.From.Id);
                 await bot.SendMessage(
                     chatId.Value,
                     "No open capture session to close.",
@@ -87,6 +163,10 @@ app.MapPost("/telegram/hook", async Task<IResult> (
             }
 
             var imageCount = await captureImageRepository!.CountBySessionAsync(closedSession.Id, cancellationToken);
+            logger.LogInformation("Closed capture session {SessionId} for user {UserId} with {ImageCount} images.",
+                closedSession.Id,
+                message.From.Id,
+                imageCount);
             await bot.SendMessage(
                 chatId.Value,
                 $"Closed session {closedSession.Id} with {imageCount} image(s).",
@@ -97,6 +177,7 @@ app.MapPost("/telegram/hook", async Task<IResult> (
 
         if (message.Photo?.Any() == true)
         {
+            logger.LogInformation("Rejected photo upload for user {UserId}; document upload required.", message.From.Id);
             await bot.SendMessage(
                 chatId.Value,
                 "Please send screenshots as PNG files (document upload), not as photos.",
@@ -109,6 +190,12 @@ app.MapPost("/telegram/hook", async Task<IResult> (
 
     if (!LooksLikePng(message.Document))
     {
+        logger.LogInformation(
+            "Rejected non-PNG document for user {UserId}. FileName={FileName}; MimeType={MimeType}; MessageId={MessageId}",
+            message.From.Id,
+            message.Document.FileName,
+            message.Document.MimeType,
+            message.MessageId);
         await bot.SendMessage(
             chatId.Value,
             "Only PNG files are accepted.",
@@ -119,10 +206,24 @@ app.MapPost("/telegram/hook", async Task<IResult> (
 
     try
     {
+        logger.LogInformation(
+            "Processing PNG document upload. UpdateId={UpdateId}; UserId={UserId}; ChatId={ChatId}; MessageId={MessageId}; FileName={FileName}; MimeType={MimeType}",
+            update.Id,
+            message.From.Id,
+            chatId.Value,
+            message.MessageId,
+            message.Document.FileName,
+            message.Document.MimeType);
+
         await using var imageStream = await DownloadFileAsync(bot, message.Document.FileId, cancellationToken);
 
         if (!HasPngSignature(imageStream))
         {
+            logger.LogInformation(
+                "Rejected invalid PNG signature for user {UserId}. MessageId={MessageId}; FileName={FileName}",
+                message.From.Id,
+                message.MessageId,
+                message.Document.FileName);
             await bot.SendMessage(
                 chatId.Value,
                 "The uploaded file is not a valid PNG.",
@@ -133,19 +234,98 @@ app.MapPost("/telegram/hook", async Task<IResult> (
 
         var objectKey = BuildObjectKey(settings.R2.ObjectPrefix, message.From.Id, message.Document.FileName);
         await UploadToR2Async(s3, settings.R2.BucketName, objectKey, imageStream, cancellationToken);
+        logger.LogInformation(
+            "Uploaded object to R2. UserId={UserId}; MessageId={MessageId}; ObjectKey={ObjectKey}",
+            message.From.Id,
+            message.MessageId,
+            objectKey);
 
         string sessionInfoSuffix = string.Empty;
         if (captureSessionsEnabled)
         {
-            var captureSession = await captureSessionRepository!.GetOrCreateOpenForUserAsync(message.From.Id, cancellationToken);
+            var captureSession = await captureSessionRepository!.GetOpenForUserAsync(message.From.Id, cancellationToken);
+            var isImplicitSingleUpload = false;
+
+            if (captureSession is null)
+            {
+                try
+                {
+                    captureSession = await captureSessionRepository.CreateAsync(message.From.Id, cancellationToken);
+                    isImplicitSingleUpload = true;
+                    logger.LogInformation(
+                        "Created implicit single-upload capture session {SessionId} for user {UserId}.",
+                        captureSession.Id,
+                        message.From.Id);
+                }
+                catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UniqueViolation)
+                {
+                    captureSession = await captureSessionRepository.GetOpenForUserAsync(message.From.Id, cancellationToken)
+                        ?? throw new InvalidOperationException(
+                            $"Failed to resolve open capture session after unique violation for user {message.From.Id}.");
+                    logger.LogInformation(
+                        "Resolved existing open capture session {SessionId} for user {UserId} during upload.",
+                        captureSession.Id,
+                        message.From.Id);
+                }
+            }
+            else
+            {
+                logger.LogInformation(
+                    "Appending upload to existing open session {SessionId} for user {UserId}.",
+                    captureSession.Id,
+                    message.From.Id);
+            }
+
             var captureImage = await captureImageRepository!.CreateNextAsync(
                 captureSession.Id,
                 objectKey,
                 message.MessageId,
                 cancellationToken
             );
+            logger.LogInformation(
+                "Persisted capture image {CaptureImageId}. SessionId={SessionId}; Sequence={Sequence}; UserId={UserId}",
+                captureImage.Id,
+                captureSession.Id,
+                captureImage.Sequence,
+                message.From.Id);
 
-            sessionInfoSuffix = $"\nSession: {captureSession.Id}\nSequence: {captureImage.Sequence}";
+            if (isImplicitSingleUpload)
+            {
+                var closedSession = await captureSessionRepository.UpdateStateAsync(
+                    captureSession.Id,
+                    CaptureSessionState.Closed,
+                    cancellationToken: cancellationToken
+                );
+                if (closedSession is null)
+                {
+                    logger.LogWarning(
+                        "Expected to close implicit single-upload session {SessionId} for user {UserId}, but no row was updated.",
+                        captureSession.Id,
+                        message.From.Id);
+                }
+                else
+                {
+                    logger.LogInformation(
+                        "Auto-closed implicit single-upload session {SessionId} for user {UserId}.",
+                        captureSession.Id,
+                        message.From.Id);
+                }
+
+                sessionInfoSuffix =
+                    $"\nSession: {captureSession.Id}\nSequence: {captureImage.Sequence}\nSession closed (single-upload mode).";
+            }
+            else
+            {
+                sessionInfoSuffix = $"\nSession: {captureSession.Id}\nSequence: {captureImage.Sequence}";
+            }
+        }
+        else
+        {
+            logger.LogWarning(
+                "Capture sessions disabled while processing upload. UserId={UserId}; MessageId={MessageId}; ObjectKey={ObjectKey}",
+                message.From.Id,
+                message.MessageId,
+                objectKey);
         }
 
         await bot.SendMessage(
@@ -156,7 +336,13 @@ app.MapPost("/telegram/hook", async Task<IResult> (
     }
     catch (Exception ex)
     {
-        logger.LogError(ex, "Failed to process Telegram file update.");
+        logger.LogError(
+            ex,
+            "Failed to process Telegram file update. UpdateId={UpdateId}; UserId={UserId}; ChatId={ChatId}; MessageId={MessageId}",
+            update.Id,
+            message.From.Id,
+            chatId.Value,
+            message.MessageId);
         await bot.SendMessage(
             chatId.Value,
             "Upload failed. Check server logs.",
@@ -168,8 +354,58 @@ app.MapPost("/telegram/hook", async Task<IResult> (
 });
 
 logger.LogInformation("PostgreSQL persistence {State}.", postgresEnabled ? "enabled" : "disabled");
+logger.LogInformation("Capture session webhook flow is active (explicit /start_session, /close|/done, implicit single-upload auto-close).");
 
 app.Run();
+
+static DatabaseTarget? ResolveDatabaseTarget(IConfiguration configuration)
+{
+    var (connectionString, source) = ResolveConfiguredConnectionString(configuration);
+    if (string.IsNullOrWhiteSpace(connectionString))
+        return null;
+
+    try
+    {
+        var builder = new NpgsqlConnectionStringBuilder(connectionString);
+        var host = string.IsNullOrWhiteSpace(builder.Host) ? "<empty>" : builder.Host;
+        var database = string.IsNullOrWhiteSpace(builder.Database) ? "<empty>" : builder.Database;
+        var username = string.IsNullOrWhiteSpace(builder.Username) ? "<empty>" : builder.Username;
+        return new DatabaseTarget(
+            Source: source,
+            Host: host,
+            Port: builder.Port,
+            Database: database,
+            Username: username
+        );
+    }
+    catch
+    {
+        return new DatabaseTarget(
+            Source: source,
+            Host: "<unparsed>",
+            Port: -1,
+            Database: "<unparsed>",
+            Username: "<unparsed>"
+        );
+    }
+}
+
+static (string? ConnectionString, string Source) ResolveConfiguredConnectionString(IConfiguration configuration)
+{
+    var connectionString = configuration.GetConnectionString("Postgres");
+    if (!string.IsNullOrWhiteSpace(connectionString))
+        return (connectionString, "ConnectionStrings:Postgres");
+
+    connectionString = configuration["DATABASE_URL"];
+    if (!string.IsNullOrWhiteSpace(connectionString))
+        return (connectionString, "DATABASE_URL");
+
+    connectionString = configuration["POSTGRES_CONNECTION_STRING"];
+    if (!string.IsNullOrWhiteSpace(connectionString))
+        return (connectionString, "POSTGRES_CONNECTION_STRING");
+
+    return (null, "none");
+}
 
 static BotSettings LoadSettings(IConfiguration configuration)
 {
@@ -227,7 +463,19 @@ static bool IsCloseSessionCommand(string? text)
 
     var command = text.Trim().Split(' ', 2, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
     return string.Equals(command, "/close", StringComparison.OrdinalIgnoreCase)
-        || command?.StartsWith("/close@", StringComparison.OrdinalIgnoreCase) == true;
+        || string.Equals(command, "/done", StringComparison.OrdinalIgnoreCase)
+        || command?.StartsWith("/close@", StringComparison.OrdinalIgnoreCase) == true
+        || command?.StartsWith("/done@", StringComparison.OrdinalIgnoreCase) == true;
+}
+
+static bool IsStartSessionCommand(string? text)
+{
+    if (string.IsNullOrWhiteSpace(text))
+        return false;
+
+    var command = text.Trim().Split(' ', 2, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+    return string.Equals(command, "/start_session", StringComparison.OrdinalIgnoreCase)
+        || command?.StartsWith("/start_session@", StringComparison.OrdinalIgnoreCase) == true;
 }
 
 static IAmazonS3 CreateS3Client(R2Settings settings)
@@ -340,6 +588,14 @@ internal sealed record R2Settings(
     string SecretAccessKey,
     string BucketName,
     string ObjectPrefix
+);
+
+internal sealed record DatabaseTarget(
+    string Source,
+    string Host,
+    int Port,
+    string Database,
+    string Username
 );
 
 public partial class Program;
