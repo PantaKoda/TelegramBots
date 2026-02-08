@@ -54,6 +54,38 @@ public sealed class CaptureSessionLifecycleRepositoryTests(PostgresRepositoryFix
     }
 
     [RequiresPostgresFact]
+    public async Task MultipleUploads_WhileSessionOpen_GroupIntoSameSession()
+    {
+        var userId = fixture.NextUserId();
+        await fixture.CleanupUserAsync(userId);
+
+        try
+        {
+            var sessionRepository = new CaptureSessionRepository(GetDataSource());
+            var imageRepository = new CaptureImageRepository(GetDataSource());
+
+            var openSession = await sessionRepository.GetOrCreateOpenForUserAsync(userId);
+            var first = await imageRepository.CreateNextAsync(openSession.Id, $"tests/{Guid.NewGuid():N}-1.png");
+            var second = await imageRepository.CreateNextAsync(openSession.Id, $"tests/{Guid.NewGuid():N}-2.png");
+            var third = await imageRepository.CreateNextAsync(openSession.Id, $"tests/{Guid.NewGuid():N}-3.png");
+            var persistedOpen = await sessionRepository.GetOpenForUserAsync(userId);
+
+            Assert.Equal(openSession.Id, first.SessionId);
+            Assert.Equal(openSession.Id, second.SessionId);
+            Assert.Equal(openSession.Id, third.SessionId);
+            Assert.Equal(1, first.Sequence);
+            Assert.Equal(2, second.Sequence);
+            Assert.Equal(3, third.Sequence);
+            Assert.NotNull(persistedOpen);
+            Assert.Equal(openSession.Id, persistedOpen!.Id);
+        }
+        finally
+        {
+            await fixture.CleanupUserAsync(userId);
+        }
+    }
+
+    [RequiresPostgresFact]
     public async Task CloseOpenForUser_ClosesCurrentAndAllowsNewOpenSession()
     {
         var userId = fixture.NextUserId();
@@ -73,6 +105,36 @@ public sealed class CaptureSessionLifecycleRepositoryTests(PostgresRepositoryFix
             Assert.Null(openAfterClose);
             Assert.NotEqual(original.Id, next.Id);
             Assert.Equal(CaptureSessionState.Open, next.State);
+        }
+        finally
+        {
+            await fixture.CleanupUserAsync(userId);
+        }
+    }
+
+    [RequiresPostgresFact]
+    public async Task UploadAfterClose_CreatesNewSessionWithSequenceReset()
+    {
+        var userId = fixture.NextUserId();
+        await fixture.CleanupUserAsync(userId);
+
+        try
+        {
+            var sessionRepository = new CaptureSessionRepository(GetDataSource());
+            var imageRepository = new CaptureImageRepository(GetDataSource());
+
+            var firstSession = await sessionRepository.GetOrCreateOpenForUserAsync(userId);
+            var firstImage = await imageRepository.CreateNextAsync(firstSession.Id, $"tests/{Guid.NewGuid():N}-1.png");
+            _ = await sessionRepository.CloseOpenForUserAsync(userId);
+
+            var secondSession = await sessionRepository.GetOrCreateOpenForUserAsync(userId);
+            var secondImage = await imageRepository.CreateNextAsync(secondSession.Id, $"tests/{Guid.NewGuid():N}-2.png");
+
+            Assert.NotEqual(firstSession.Id, secondSession.Id);
+            Assert.Equal(1, firstImage.Sequence);
+            Assert.Equal(1, secondImage.Sequence);
+            Assert.Equal(firstSession.Id, firstImage.SessionId);
+            Assert.Equal(secondSession.Id, secondImage.SessionId);
         }
         finally
         {

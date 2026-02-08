@@ -140,9 +140,12 @@ As of now, the system implements **ONLY**:
   - connection string wiring (`ConnectionStrings:Postgres` or `DATABASE_URL`)
   - repository layer for `capture_session`, `capture_image`, `day_schedule`, `schedule_version`
 - Capture session lifecycle in webhook flow:
-  - first valid PNG upload opens (or reuses) a user session in `open` state
-  - subsequent valid uploads are appended to the open session with deterministic `sequence`
-  - explicit close command (`/close`) transitions the active session to `closed`
+  - explicit multi-image mode:
+    - `/start_session` opens (or reuses) a user session in `open` state
+    - subsequent valid uploads are appended to the open session with deterministic `sequence`
+    - `/close` or `/done` transitions the active session to `closed`
+  - implicit single-image mode:
+    - if no open session exists, a valid PNG upload creates a session, stores image with `sequence = 1`, and immediately closes that session
 - DB-level grouping invariants:
   - at most one open session per user
   - images can be inserted only while their capture session state is `open`

@@ -1,5 +1,6 @@
 using Amazon.S3;
 using Amazon.S3.Model;
+using Npgsql;
 using TelegramImageBot.Data;
 using Telegram.Bot;
 using Telegram.Bot.Types;
@@ -63,6 +64,49 @@ app.MapPost("/telegram/hook", async Task<IResult> (
 
     if (message.Document is null)
     {
+        if (IsStartSessionCommand(message.Text))
+        {
+            if (!captureSessionsEnabled)
+            {
+                await bot.SendMessage(
+                    chatId.Value,
+                    "Capture sessions are unavailable. Configure PostgreSQL and DATABASE_URL first.",
+                    cancellationToken: cancellationToken
+                );
+                return Results.Ok();
+            }
+
+            var existingSession = await captureSessionRepository!.GetOpenForUserAsync(message.From.Id, cancellationToken);
+            if (existingSession is not null)
+            {
+                await bot.SendMessage(
+                    chatId.Value,
+                    $"A session is already open: {existingSession.Id}. Upload PNG documents, then send /close when done.",
+                    cancellationToken: cancellationToken
+                );
+                return Results.Ok();
+            }
+
+            CaptureSessionRecord startedSession;
+            try
+            {
+                startedSession = await captureSessionRepository.CreateAsync(message.From.Id, cancellationToken);
+            }
+            catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UniqueViolation)
+            {
+                startedSession = await captureSessionRepository.GetOpenForUserAsync(message.From.Id, cancellationToken)
+                    ?? throw new InvalidOperationException(
+                        $"Failed to resolve open capture session after unique violation for user {message.From.Id}.");
+            }
+
+            await bot.SendMessage(
+                chatId.Value,
+                $"Opened session {startedSession.Id}. Upload PNG documents and send /close when done.",
+                cancellationToken: cancellationToken
+            );
+            return Results.Ok();
+        }
+
         if (IsCloseSessionCommand(message.Text))
         {
             if (!captureSessionsEnabled)
@@ -137,7 +181,24 @@ app.MapPost("/telegram/hook", async Task<IResult> (
         string sessionInfoSuffix = string.Empty;
         if (captureSessionsEnabled)
         {
-            var captureSession = await captureSessionRepository!.GetOrCreateOpenForUserAsync(message.From.Id, cancellationToken);
+            var captureSession = await captureSessionRepository!.GetOpenForUserAsync(message.From.Id, cancellationToken);
+            var isImplicitSingleUpload = false;
+
+            if (captureSession is null)
+            {
+                try
+                {
+                    captureSession = await captureSessionRepository.CreateAsync(message.From.Id, cancellationToken);
+                    isImplicitSingleUpload = true;
+                }
+                catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UniqueViolation)
+                {
+                    captureSession = await captureSessionRepository.GetOpenForUserAsync(message.From.Id, cancellationToken)
+                        ?? throw new InvalidOperationException(
+                            $"Failed to resolve open capture session after unique violation for user {message.From.Id}.");
+                }
+            }
+
             var captureImage = await captureImageRepository!.CreateNextAsync(
                 captureSession.Id,
                 objectKey,
@@ -145,7 +206,21 @@ app.MapPost("/telegram/hook", async Task<IResult> (
                 cancellationToken
             );
 
-            sessionInfoSuffix = $"\nSession: {captureSession.Id}\nSequence: {captureImage.Sequence}";
+            if (isImplicitSingleUpload)
+            {
+                _ = await captureSessionRepository.UpdateStateAsync(
+                    captureSession.Id,
+                    CaptureSessionState.Closed,
+                    cancellationToken: cancellationToken
+                );
+
+                sessionInfoSuffix =
+                    $"\nSession: {captureSession.Id}\nSequence: {captureImage.Sequence}\nSession closed (single-upload mode).";
+            }
+            else
+            {
+                sessionInfoSuffix = $"\nSession: {captureSession.Id}\nSequence: {captureImage.Sequence}";
+            }
         }
 
         await bot.SendMessage(
@@ -227,7 +302,19 @@ static bool IsCloseSessionCommand(string? text)
 
     var command = text.Trim().Split(' ', 2, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
     return string.Equals(command, "/close", StringComparison.OrdinalIgnoreCase)
-        || command?.StartsWith("/close@", StringComparison.OrdinalIgnoreCase) == true;
+        || string.Equals(command, "/done", StringComparison.OrdinalIgnoreCase)
+        || command?.StartsWith("/close@", StringComparison.OrdinalIgnoreCase) == true
+        || command?.StartsWith("/done@", StringComparison.OrdinalIgnoreCase) == true;
+}
+
+static bool IsStartSessionCommand(string? text)
+{
+    if (string.IsNullOrWhiteSpace(text))
+        return false;
+
+    var command = text.Trim().Split(' ', 2, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+    return string.Equals(command, "/start_session", StringComparison.OrdinalIgnoreCase)
+        || command?.StartsWith("/start_session@", StringComparison.OrdinalIgnoreCase) == true;
 }
 
 static IAmazonS3 CreateS3Client(R2Settings settings)
