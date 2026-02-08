@@ -40,7 +40,11 @@ app.MapGet("/health/db", async Task<IResult> (IServiceProvider services, Cancell
     }
 });
 
-app.MapPost("/telegram/hook", async Task<IResult> (HttpRequest req, Update update, CancellationToken cancellationToken) =>
+app.MapPost("/telegram/hook", async Task<IResult> (
+    HttpRequest req,
+    Update update,
+    IServiceProvider services,
+    CancellationToken cancellationToken) =>
 {
     if (!IsSecretValid(req, settings.WebhookSecret))
         return Results.Unauthorized();
@@ -53,8 +57,44 @@ app.MapPost("/telegram/hook", async Task<IResult> (HttpRequest req, Update updat
     if (settings.AllowedUserId is not null && message.From.Id != settings.AllowedUserId.Value)
         return Results.Ok();
 
+    var captureSessionRepository = services.GetService<ICaptureSessionRepository>();
+    var captureImageRepository = services.GetService<ICaptureImageRepository>();
+    var captureSessionsEnabled = CanUseCaptureSessions(captureSessionRepository, captureImageRepository);
+
     if (message.Document is null)
     {
+        if (IsCloseSessionCommand(message.Text))
+        {
+            if (!captureSessionsEnabled)
+            {
+                await bot.SendMessage(
+                    chatId.Value,
+                    "Capture sessions are unavailable. Configure PostgreSQL and DATABASE_URL first.",
+                    cancellationToken: cancellationToken
+                );
+                return Results.Ok();
+            }
+
+            var closedSession = await captureSessionRepository!.CloseOpenForUserAsync(message.From.Id, cancellationToken);
+            if (closedSession is null)
+            {
+                await bot.SendMessage(
+                    chatId.Value,
+                    "No open capture session to close.",
+                    cancellationToken: cancellationToken
+                );
+                return Results.Ok();
+            }
+
+            var imageCount = await captureImageRepository!.CountBySessionAsync(closedSession.Id, cancellationToken);
+            await bot.SendMessage(
+                chatId.Value,
+                $"Closed session {closedSession.Id} with {imageCount} image(s).",
+                cancellationToken: cancellationToken
+            );
+            return Results.Ok();
+        }
+
         if (message.Photo?.Any() == true)
         {
             await bot.SendMessage(
@@ -94,9 +134,23 @@ app.MapPost("/telegram/hook", async Task<IResult> (HttpRequest req, Update updat
         var objectKey = BuildObjectKey(settings.R2.ObjectPrefix, message.From.Id, message.Document.FileName);
         await UploadToR2Async(s3, settings.R2.BucketName, objectKey, imageStream, cancellationToken);
 
+        string sessionInfoSuffix = string.Empty;
+        if (captureSessionsEnabled)
+        {
+            var captureSession = await captureSessionRepository!.GetOrCreateOpenForUserAsync(message.From.Id, cancellationToken);
+            var captureImage = await captureImageRepository!.CreateNextAsync(
+                captureSession.Id,
+                objectKey,
+                message.MessageId,
+                cancellationToken
+            );
+
+            sessionInfoSuffix = $"\nSession: {captureSession.Id}\nSequence: {captureImage.Sequence}";
+        }
+
         await bot.SendMessage(
             chatId.Value,
-            $"Uploaded to R2: {objectKey}",
+            $"Uploaded to R2: {objectKey}{sessionInfoSuffix}",
             cancellationToken: cancellationToken
         );
     }
@@ -159,6 +213,21 @@ static bool IsSecretValid(HttpRequest request, string? expectedSecret)
 
     return request.Headers.TryGetValue("X-Telegram-Bot-Api-Secret-Token", out var receivedSecret)
         && string.Equals(receivedSecret, expectedSecret, StringComparison.Ordinal);
+}
+
+static bool CanUseCaptureSessions(ICaptureSessionRepository? sessionRepository, ICaptureImageRepository? imageRepository)
+{
+    return sessionRepository is not null && imageRepository is not null;
+}
+
+static bool IsCloseSessionCommand(string? text)
+{
+    if (string.IsNullOrWhiteSpace(text))
+        return false;
+
+    var command = text.Trim().Split(' ', 2, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+    return string.Equals(command, "/close", StringComparison.OrdinalIgnoreCase)
+        || command?.StartsWith("/close@", StringComparison.OrdinalIgnoreCase) == true;
 }
 
 static IAmazonS3 CreateS3Client(R2Settings settings)
