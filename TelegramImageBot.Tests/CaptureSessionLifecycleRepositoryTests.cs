@@ -81,6 +81,32 @@ public sealed class CaptureSessionLifecycleRepositoryTests(PostgresRepositoryFix
     }
 
     [RequiresPostgresFact]
+    public async Task CreateNext_WhenSessionClosed_ThrowsDomainGuardError()
+    {
+        var userId = fixture.NextUserId();
+        await fixture.CleanupUserAsync(userId);
+
+        try
+        {
+            var sessionRepository = new CaptureSessionRepository(GetDataSource());
+            var imageRepository = new CaptureImageRepository(GetDataSource());
+
+            var session = await sessionRepository.GetOrCreateOpenForUserAsync(userId);
+            _ = await imageRepository.CreateNextAsync(session.Id, $"tests/{Guid.NewGuid():N}-1.png");
+            _ = await sessionRepository.CloseOpenForUserAsync(userId);
+
+            var closedInsert = await Assert.ThrowsAsync<PostgresException>(
+                () => imageRepository.CreateNextAsync(session.Id, $"tests/{Guid.NewGuid():N}-closed.png"));
+
+            Assert.Equal("P0001", closedInsert.SqlState);
+        }
+        finally
+        {
+            await fixture.CleanupUserAsync(userId);
+        }
+    }
+
+    [RequiresPostgresFact]
     public async Task CloseOpenForUser_WhenNoneOpen_ReturnsNull()
     {
         var userId = fixture.NextUserId();

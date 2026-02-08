@@ -135,7 +135,7 @@ As of now, the system implements **ONLY**:
 - Accepts PNG screenshots sent as Telegram documents
 - Validates PNG format
 - Uploads images directly to Cloudflare R2
-- PostgreSQL schema bootstrap SQL (`database/001_schedule_ingest_schema.sql`, `database/002_capture_session_single_open_per_user.sql`)
+- PostgreSQL schema bootstrap SQL (`database/001_schedule_ingest_schema.sql`, `database/002_capture_session_single_open_per_user.sql`, `database/003_capture_image_require_open_session.sql`)
 - PostgreSQL C# runtime foundation:
   - connection string wiring (`ConnectionStrings:Postgres` or `DATABASE_URL`)
   - repository layer for `capture_session`, `capture_image`, `day_schedule`, `schedule_version`
@@ -143,6 +143,9 @@ As of now, the system implements **ONLY**:
   - first valid PNG upload opens (or reuses) a user session in `open` state
   - subsequent valid uploads are appended to the open session with deterministic `sequence`
   - explicit close command (`/close`) transitions the active session to `closed`
+- DB-level grouping invariants:
+  - at most one open session per user
+  - images can be inserted only while their capture session state is `open`
 - Explicit multi-image grouping by active open capture session
 
 The following are **NOT implemented**:
