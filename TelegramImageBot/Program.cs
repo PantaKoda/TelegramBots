@@ -1,11 +1,13 @@
 using Amazon.S3;
 using Amazon.S3.Model;
+using TelegramImageBot.Data;
 using Telegram.Bot;
 using Telegram.Bot.Types;
 
 var builder = WebApplication.CreateBuilder(args);
 
 var settings = LoadSettings(builder.Configuration);
+var postgresEnabled = builder.Services.AddSchedulePersistence(builder.Configuration);
 var bot = new TelegramBotClient(settings.BotToken);
 var s3 = CreateS3Client(settings.R2);
 
@@ -13,6 +15,30 @@ var app = builder.Build();
 var logger = app.Logger;
 
 app.MapGet("/", () => Results.Ok("Telegram image bot is running."));
+app.MapGet("/health/db", async Task<IResult> (IServiceProvider services, CancellationToken cancellationToken) =>
+{
+    var dataSource = services.GetService<Npgsql.NpgsqlDataSource>();
+    if (dataSource is null)
+    {
+        return Results.Ok(new
+        {
+            status = "disabled",
+            reason = "DATABASE_URL or ConnectionStrings:Postgres is not configured."
+        });
+    }
+
+    try
+    {
+        await using var command = dataSource.CreateCommand("SELECT 1");
+        _ = await command.ExecuteScalarAsync(cancellationToken);
+        return Results.Ok(new { status = "ok" });
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Database health check failed.");
+        return Results.Problem("Database connectivity check failed.", statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+});
 
 app.MapPost("/telegram/hook", async Task<IResult> (HttpRequest req, Update update, CancellationToken cancellationToken) =>
 {
@@ -86,6 +112,8 @@ app.MapPost("/telegram/hook", async Task<IResult> (HttpRequest req, Update updat
 
     return Results.Ok();
 });
+
+logger.LogInformation("PostgreSQL persistence {State}.", postgresEnabled ? "enabled" : "disabled");
 
 app.Run();
 
@@ -246,4 +274,3 @@ internal sealed record R2Settings(
 );
 
 public partial class Program;
-

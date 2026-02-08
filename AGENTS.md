@@ -1,45 +1,187 @@
 # Repository Guidelines
 
+## AGENTS.md Authority & Update Policy (Mandatory)
+
+AGENTS.md is the **authoritative description of the system** for AI agents.
+
+Any change that affects one or more of the following **MUST update AGENTS.md in the same commit or PR**:
+
+- System architecture or data flow
+- Introduction of new subsystems (e.g. PostgreSQL, OCR worker)
+- Changes to the lifecycle of uploads or capture sessions
+- New non-negotiable design constraints
+- Changes to what is considered **current implementation** vs **planned / target architecture**
+
+When implementing a feature:
+- Update **Current Implementation Status** to reflect reality
+- Update **Target Architecture & Intent** if goals or structure change
+- Update **Non-Negotiable Design Rules** if new constraints are introduced
+
+If a change does **not** require an AGENTS.md update, state this explicitly in the commit or PR description.
+
+---
+
+## Branching & Workflow Rules (Mandatory)
+
+- The `main` branch must always remain deployable and reflect production.
+- All new work must be done in **feature branches**.
+- One feature branch = one conceptual change (e.g. sessions, PostgreSQL, OCR orchestration).
+- AI agents must **NEVER** commit directly to `main`.
+- Feature branches must not introduce partially implemented architecture.
+- Merge to `main` only when the feature branch is complete and reviewed.
+
+---
+
+## Testing & Verification Rules (Mandatory)
+
+### Baseline guarantees (must never break)
+Do not merge to `main` unless all of the following still work end-to-end:
+
+- Telegram webhook endpoint responds with `200 OK` for valid updates
+- PNG document upload succeeds and results in an object in Cloudflare R2
+- Invalid uploads are rejected (non-PNG, Telegram photo uploads)
+- Optional webhook secret validation still works when enabled
+
+### Test expectations
+- If a change touches logic, add or extend automated tests where feasible:
+  - Prefer **unit tests** for pure logic (validators, session state machine)
+  - Prefer **integration tests** for persistence (PostgreSQL) and job transitions
+  - Unit tests must not require real Telegram or real R2
+
+- When automated tests do not yet exist:
+  - Add a minimal test project **before** adding complex behavior (sessions, PostgreSQL, queueing)
+  - At minimum, add smoke-level tests for:
+    - session creation / close transitions
+    - database repository read/write
+    - idempotency (replaying the same Telegram update must not duplicate work)
+
+- Every PR or commit must include a short **“How to test”** note:
+  - commands run (e.g. `dotnet test`, `dotnet build`)
+  - manual smoke steps if applicable
+
+---
+
 ## Project Structure & Module Organization
-- `TelegramBots.sln` is the solution entry point.
-- `TelegramImageBot/` contains the single web app project.
-- `TelegramImageBot/Program.cs` hosts the minimal API, Telegram webhook handling, PNG validation, and Cloudflare R2 upload flow.
-- `TelegramImageBot/appsettings.json` and `TelegramImageBot/appsettings.Development.json` hold configuration defaults.
-- `TelegramImageBot/Properties/` contains local launch settings.
-- `TelegramImageBot/bin/` and `TelegramImageBot/obj/` are build outputs and should not be edited.
+
+- `TelegramBots.sln` — solution entry point
+- `TelegramImageBot/` — webhook web app project
+- `TelegramImageBot.Tests/` — integration / smoke tests for the webhook API
+- `database/` — PostgreSQL schema bootstrap SQL files
+- `TelegramImageBot/Program.cs` — minimal API, Telegram webhook handling, PNG validation, Cloudflare R2 upload
+- `TelegramImageBot/appsettings.json` and `TelegramImageBot/appsettings.Development.json` — configuration defaults
+- `TelegramImageBot/Properties/` — local launch settings
+- `TelegramImageBot/bin/`, `TelegramImageBot/obj/` — build outputs (do not edit)
+
+---
 
 ## Project Description
-- The app is a personal Telegram webhook bot that accepts image uploads and stores them in Cloudflare R2 through the S3-compatible API.
-- Uploads are restricted to PNG files only.
-- Photo uploads are rejected; screenshots must be sent as document files to preserve PNG quality.
-- Optional user restriction is supported through `TELEGRAM_ALLOWED_USER_ID`.
-- Optional webhook header validation is supported through `TELEGRAM_WEBHOOK_SECRET`.
+
+- The project extracts, stores, and tracks a user’s **daily work schedule** from a **mobile-only application**.
+- There is **no web version and no public API**.
+- The system is implemented as a **personal Telegram webhook bot**.
+- Screenshots are sent via Telegram and stored in **Cloudflare R2** using the S3-compatible API.
+
+Operational constraints:
+- Uploads are restricted to **PNG files only**
+- Telegram **photo uploads are rejected**; screenshots must be sent as **document files**
+- Optional user restriction via `TELEGRAM_ALLOWED_USER_ID`
+- Optional webhook validation via `TELEGRAM_WEBHOOK_SECRET`
+
+---
 
 ## Build, Test, and Development Commands
-- `dotnet restore TelegramImageBot/TelegramImageBot.csproj` restores NuGet packages.
-- `dotnet build TelegramImageBot/TelegramImageBot.csproj -c Release` compiles the app.
-- `dotnet run --project TelegramImageBot/TelegramImageBot.csproj` runs the webhook listener locally.
-- `dotnet publish TelegramImageBot/TelegramImageBot.csproj -c Release -o out` produces a deployable build.
-- `docker build -t telegram-image-bot -f TelegramImageBot/Dockerfile .` builds the container image.
+
+- `dotnet restore TelegramImageBot/TelegramImageBot.csproj`
+- `dotnet build TelegramImageBot/TelegramImageBot.csproj -c Release`
+- `dotnet run --project TelegramImageBot/TelegramImageBot.csproj`
+- `dotnet publish TelegramImageBot/TelegramImageBot.csproj -c Release -o out`
+- `docker build -t telegram-image-bot -f TelegramImageBot/Dockerfile .`
+- `dotnet test TelegramBots.sln -c Release`
+
+---
 
 ## Coding Style & Naming Conventions
-- Language: C# with nullable reference types enabled.
-- Indentation: 4 spaces, no tabs.
-- Use `PascalCase` for public types and methods, `camelCase` for locals and parameters.
-- Keep Program.cs minimal; extract helpers into new files as the bot grows.
 
-## Testing Guidelines
-- No test project is present yet. If you add one, use `dotnet test` at the solution root.
-- Name tests with clear intent, e.g., `Webhook_Rejects_InvalidSecret`.
+- Language: C# (use the language version configured in the project)
+- Nullable reference types enabled and respected
+- Indentation: 4 spaces, no tabs
+- `PascalCase` for public types and members
+- `camelCase` for locals and parameters
+- Keep `Program.cs` minimal; extract helpers as the bot grows
+- Prefer clarity and maintainability over cleverness
 
-## Commit & Pull Request Guidelines
-- Git history is minimal and does not show a formal convention. Use short, imperative messages (e.g., "Add webhook validation").
-- PRs should include: a concise summary, linked issue (if any), and notes on config changes or required env vars.
+---
 
-## Security & Configuration Tips
-- Set `TELEGRAM_BOT_TOKEN` in environment variables or user secrets.
-- Optional: set `TELEGRAM_WEBHOOK_SECRET` and ensure Telegram sends `X-Telegram-Bot-Api-Secret-Token`.
-- Optional: set `TELEGRAM_ALLOWED_USER_ID` to process uploads only from your Telegram account.
-- Required for R2 uploads: `R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`.
-- Optional for R2 key naming: `R2_OBJECT_PREFIX` (default: `screenshots`).
-- Never commit real tokens or R2 keys in `appsettings*.json`.
+## Security & Configuration
+
+- `TELEGRAM_BOT_TOKEN` must be set via environment variables or user secrets
+- Optional: `TELEGRAM_WEBHOOK_SECRET`
+- Optional: `TELEGRAM_ALLOWED_USER_ID`
+- Required for R2:
+  - `R2_ENDPOINT`
+  - `R2_ACCESS_KEY_ID`
+  - `R2_SECRET_ACCESS_KEY`
+  - `R2_BUCKET_NAME`
+- Optional: `R2_OBJECT_PREFIX` (default: `screenshots`)
+- **Never commit secrets** to `appsettings*.json`
+
+---
+
+## Current Implementation Status (Authoritative)
+
+As of now, the system implements **ONLY**:
+
+- C# .NET Telegram webhook bot
+- Accepts PNG screenshots sent as Telegram documents
+- Validates PNG format
+- Uploads images directly to Cloudflare R2
+- PostgreSQL schema bootstrap SQL (`database/001_schedule_ingest_schema.sql`)
+- PostgreSQL C# runtime foundation:
+  - connection string wiring (`ConnectionStrings:Postgres` or `DATABASE_URL`)
+  - repository layer for `capture_session`, `capture_image`, `day_schedule`, `schedule_version`
+
+The following are **NOT implemented**:
+
+- Capture session lifecycle in webhook flow
+- Multi-image grouping behavior in webhook flow
+- OCR
+- Schedule parsing
+- Versioning/update detection behavior in webhook flow
+
+Everything below describes **target architecture** and is **not yet implemented**.
+
+---
+
+## Target Architecture & Intent
+
+The project will evolve into a **schedule ingestion pipeline** with these properties:
+
+- Screenshots are **transient inputs**, not business entities
+- The core business entity is a **versioned daily schedule**
+- Each calendar day may have multiple **immutable versions**
+- Screenshots uploaded together are grouped into **explicit capture sessions**
+- OCR runs **once per closed capture session**, never per image
+- OCR is performed by a **separate Python service** using PaddleOCR
+- Parsed schedules are immutable; updates create **new versions**
+- PostgreSQL will be introduced as:
+  - the source of truth for capture session state
+  - the coordination / job queue mechanism for OCR
+  - the storage for schedule versions
+- Cloudflare R2 remains **blob storage only**
+
+---
+
+## Non-Negotiable Design Rules
+
+The following constraints are intentional and must not be violated:
+
+- Do **NOT** run OCR on each image upload
+- Do **NOT** infer screenshot grouping heuristically
+- Grouping must be **explicit** via capture sessions
+- Do **NOT** stitch images together
+- Do **NOT** overwrite previously parsed schedules
+- Every upload attempt produces a **new immutable schedule version**
+- Date identity must come from **OCR of UI text**, not filenames or timestamps
+- PostgreSQL is the **state + coordination mechanism**
+- Cloudflare R2 is **blob storage only**
+- The Python OCR worker runs **out-of-process** (never embedded in ASP.NET)
