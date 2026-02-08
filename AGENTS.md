@@ -135,15 +135,18 @@ As of now, the system implements **ONLY**:
 - Accepts PNG screenshots sent as Telegram documents
 - Validates PNG format
 - Uploads images directly to Cloudflare R2
-- PostgreSQL schema bootstrap SQL (`database/001_schedule_ingest_schema.sql`)
+- PostgreSQL schema bootstrap SQL (`database/001_schedule_ingest_schema.sql`, `database/002_capture_session_single_open_per_user.sql`)
 - PostgreSQL C# runtime foundation:
   - connection string wiring (`ConnectionStrings:Postgres` or `DATABASE_URL`)
   - repository layer for `capture_session`, `capture_image`, `day_schedule`, `schedule_version`
+- Capture session lifecycle in webhook flow:
+  - first valid PNG upload opens (or reuses) a user session in `open` state
+  - subsequent valid uploads are appended to the open session with deterministic `sequence`
+  - explicit close command (`/close`) transitions the active session to `closed`
+- Explicit multi-image grouping by active open capture session
 
 The following are **NOT implemented**:
 
-- Capture session lifecycle in webhook flow
-- Multi-image grouping behavior in webhook flow
 - OCR
 - Schedule parsing
 - Versioning/update detection behavior in webhook flow
@@ -163,8 +166,7 @@ The project will evolve into a **schedule ingestion pipeline** with these proper
 - OCR runs **once per closed capture session**, never per image
 - OCR is performed by a **separate Python service** using PaddleOCR
 - Parsed schedules are immutable; updates create **new versions**
-- PostgreSQL will be introduced as:
-  - the source of truth for capture session state
+- PostgreSQL already acts as the source of truth for capture session state and will additionally evolve into:
   - the coordination / job queue mechanism for OCR
   - the storage for schedule versions
 - Cloudflare R2 remains **blob storage only**

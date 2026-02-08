@@ -111,6 +111,9 @@ internal sealed record ScheduleVersionRecord(
 internal interface ICaptureSessionRepository
 {
     Task<CaptureSessionRecord> CreateAsync(long userId, CancellationToken cancellationToken = default);
+    Task<CaptureSessionRecord> GetOrCreateOpenForUserAsync(long userId, CancellationToken cancellationToken = default);
+    Task<CaptureSessionRecord?> GetOpenForUserAsync(long userId, CancellationToken cancellationToken = default);
+    Task<CaptureSessionRecord?> CloseOpenForUserAsync(long userId, CancellationToken cancellationToken = default);
     Task<CaptureSessionRecord?> GetByIdAsync(Guid sessionId, CancellationToken cancellationToken = default);
     Task<CaptureSessionRecord?> UpdateStateAsync(
         Guid sessionId,
@@ -128,6 +131,13 @@ internal interface ICaptureImageRepository
         long? telegramMessageId = null,
         CancellationToken cancellationToken = default);
 
+    Task<CaptureImageRecord> CreateNextAsync(
+        Guid sessionId,
+        string r2Key,
+        long? telegramMessageId = null,
+        CancellationToken cancellationToken = default);
+
+    Task<int> CountBySessionAsync(Guid sessionId, CancellationToken cancellationToken = default);
     Task<IReadOnlyList<CaptureImageRecord>> ListBySessionAsync(Guid sessionId, CancellationToken cancellationToken = default);
 }
 
@@ -169,6 +179,85 @@ internal sealed class CaptureSessionRepository(NpgsqlDataSource dataSource) : IC
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         if (!await reader.ReadAsync(cancellationToken))
             throw new InvalidOperationException("Insert into capture_session returned no rows.");
+
+        return MapCaptureSession(reader);
+    }
+
+    public async Task<CaptureSessionRecord> GetOrCreateOpenForUserAsync(long userId, CancellationToken cancellationToken = default)
+    {
+        var existingSession = await GetOpenForUserAsync(userId, cancellationToken);
+        if (existingSession is not null)
+            return existingSession;
+
+        const string insertSql = """
+            INSERT INTO schedule_ingest.capture_session (user_id)
+            VALUES (@user_id)
+            ON CONFLICT DO NOTHING
+            RETURNING id, user_id, state, created_at, closed_at, error;
+            """;
+
+        await using var insertCommand = dataSource.CreateCommand(insertSql);
+        insertCommand.Parameters.AddWithValue("user_id", userId);
+
+        await using (var insertReader = await insertCommand.ExecuteReaderAsync(cancellationToken))
+        {
+            if (await insertReader.ReadAsync(cancellationToken))
+                return MapCaptureSession(insertReader);
+        }
+
+        existingSession = await GetOpenForUserAsync(userId, cancellationToken);
+        if (existingSession is null)
+            throw new InvalidOperationException($"Failed to resolve an open capture session for user {userId}.");
+
+        return existingSession;
+    }
+
+    public async Task<CaptureSessionRecord?> GetOpenForUserAsync(long userId, CancellationToken cancellationToken = default)
+    {
+        const string sql = """
+            SELECT id, user_id, state, created_at, closed_at, error
+            FROM schedule_ingest.capture_session
+            WHERE user_id = @user_id
+              AND state = 'open'::schedule_ingest.capture_session_state
+            ORDER BY created_at DESC
+            LIMIT 1;
+            """;
+
+        await using var command = dataSource.CreateCommand(sql);
+        command.Parameters.AddWithValue("user_id", userId);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+            return null;
+
+        return MapCaptureSession(reader);
+    }
+
+    public async Task<CaptureSessionRecord?> CloseOpenForUserAsync(long userId, CancellationToken cancellationToken = default)
+    {
+        const string sql = """
+            WITH target AS (
+                SELECT id
+                FROM schedule_ingest.capture_session
+                WHERE user_id = @user_id
+                  AND state = 'open'::schedule_ingest.capture_session_state
+                ORDER BY created_at DESC
+                LIMIT 1
+                FOR UPDATE
+            )
+            UPDATE schedule_ingest.capture_session AS session
+            SET state = 'closed'::schedule_ingest.capture_session_state
+            FROM target
+            WHERE session.id = target.id
+            RETURNING session.id, session.user_id, session.state, session.created_at, session.closed_at, session.error;
+            """;
+
+        await using var command = dataSource.CreateCommand(sql);
+        command.Parameters.AddWithValue("user_id", userId);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+            return null;
 
         return MapCaptureSession(reader);
     }
@@ -268,6 +357,87 @@ internal sealed class CaptureImageRepository(NpgsqlDataSource dataSource) : ICap
             throw new InvalidOperationException("Insert into capture_image returned no rows.");
 
         return MapCaptureImage(reader);
+    }
+
+    public async Task<CaptureImageRecord> CreateNextAsync(
+        Guid sessionId,
+        string r2Key,
+        long? telegramMessageId = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(r2Key))
+            throw new ArgumentException("R2 key cannot be empty.", nameof(r2Key));
+
+        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+
+        const string lockSql = """
+            SELECT id
+            FROM schedule_ingest.capture_session
+            WHERE id = @session_id
+            FOR UPDATE;
+            """;
+
+        await using (var lockCommand = new NpgsqlCommand(lockSql, connection, transaction))
+        {
+            lockCommand.Parameters.AddWithValue("session_id", sessionId);
+            var lockResult = await lockCommand.ExecuteScalarAsync(cancellationToken);
+            if (lockResult is null)
+                throw new InvalidOperationException($"Capture session {sessionId} was not found.");
+        }
+
+        const string nextSequenceSql = """
+            SELECT COALESCE(MAX(sequence), 0) + 1
+            FROM schedule_ingest.capture_image
+            WHERE session_id = @session_id;
+            """;
+
+        int nextSequence;
+        await using (var sequenceCommand = new NpgsqlCommand(nextSequenceSql, connection, transaction))
+        {
+            sequenceCommand.Parameters.AddWithValue("session_id", sessionId);
+            var scalar = await sequenceCommand.ExecuteScalarAsync(cancellationToken);
+            nextSequence = Convert.ToInt32(scalar);
+        }
+
+        const string insertSql = """
+            INSERT INTO schedule_ingest.capture_image (session_id, sequence, r2_key, telegram_message_id)
+            VALUES (@session_id, @sequence, @r2_key, @telegram_message_id)
+            RETURNING id, session_id, sequence, r2_key, telegram_message_id, created_at;
+            """;
+
+        CaptureImageRecord image;
+        await using (var insertCommand = new NpgsqlCommand(insertSql, connection, transaction))
+        {
+            insertCommand.Parameters.AddWithValue("session_id", sessionId);
+            insertCommand.Parameters.AddWithValue("sequence", nextSequence);
+            insertCommand.Parameters.AddWithValue("r2_key", r2Key);
+            var messageIdParameter = insertCommand.Parameters.Add("telegram_message_id", NpgsqlDbType.Bigint);
+            messageIdParameter.Value = (object?)telegramMessageId ?? DBNull.Value;
+
+            await using var reader = await insertCommand.ExecuteReaderAsync(cancellationToken);
+            if (!await reader.ReadAsync(cancellationToken))
+                throw new InvalidOperationException("Insert into capture_image returned no rows.");
+
+            image = MapCaptureImage(reader);
+        }
+
+        await transaction.CommitAsync(cancellationToken);
+        return image;
+    }
+
+    public async Task<int> CountBySessionAsync(Guid sessionId, CancellationToken cancellationToken = default)
+    {
+        const string sql = """
+            SELECT COUNT(*)
+            FROM schedule_ingest.capture_image
+            WHERE session_id = @session_id;
+            """;
+
+        await using var command = dataSource.CreateCommand(sql);
+        command.Parameters.AddWithValue("session_id", sessionId);
+        var result = await command.ExecuteScalarAsync(cancellationToken);
+        return Convert.ToInt32(result);
     }
 
     public async Task<IReadOnlyList<CaptureImageRecord>> ListBySessionAsync(
