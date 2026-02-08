@@ -3,7 +3,8 @@ using TelegramImageBot.Data;
 
 namespace TelegramImageBot.Tests;
 
-public sealed class CaptureSessionLifecycleRepositoryTests(PostgresRepositoryFixture fixture) : IClassFixture<PostgresRepositoryFixture>
+[Collection("PostgresIntegration")]
+public sealed class CaptureSessionLifecycleRepositoryTests(PostgresRepositoryFixture fixture)
 {
     [RequiresPostgresFact]
     public async Task GetOrCreateOpenForUser_ReturnsSameOpenSession()

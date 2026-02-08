@@ -23,6 +23,7 @@ internal static class PostgresTestConfiguration
 public sealed class PostgresRepositoryFixture : IAsyncLifetime
 {
     private static long _userIdSeed = -900_000_000_000_000_000;
+    private static readonly SemaphoreSlim SchemaApplyLock = new(1, 1);
 
     public NpgsqlDataSource? DataSource { get; private set; }
 
@@ -32,8 +33,16 @@ public sealed class PostgresRepositoryFixture : IAsyncLifetime
         if (string.IsNullOrWhiteSpace(connectionString))
             return;
 
-        DataSource = new NpgsqlDataSourceBuilder(connectionString).Build();
-        await ApplySchemaAsync(DataSource);
+        await SchemaApplyLock.WaitAsync();
+        try
+        {
+            DataSource = new NpgsqlDataSourceBuilder(connectionString).Build();
+            await ApplySchemaAsync(DataSource);
+        }
+        finally
+        {
+            SchemaApplyLock.Release();
+        }
     }
 
     public async Task DisposeAsync()

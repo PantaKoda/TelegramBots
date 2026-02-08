@@ -2,6 +2,7 @@ using Amazon.S3;
 using Amazon.S3.Model;
 using Npgsql;
 using TelegramImageBot.Data;
+using TelegramImageBot.Workers;
 using Telegram.Bot;
 using Telegram.Bot.Types;
 
@@ -9,6 +10,11 @@ var builder = WebApplication.CreateBuilder(args);
 
 var settings = LoadSettings(builder.Configuration);
 var postgresEnabled = builder.Services.AddSchedulePersistence(builder.Configuration);
+if (postgresEnabled)
+{
+    builder.Services.AddHostedService<CaptureSessionDispatcherService>();
+}
+
 var databaseTarget = ResolveDatabaseTarget(builder.Configuration);
 var bot = new TelegramBotClient(settings.BotToken);
 var s3 = CreateS3Client(settings.R2);
