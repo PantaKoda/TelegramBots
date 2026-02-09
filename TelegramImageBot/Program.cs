@@ -39,6 +39,8 @@ else
         "No PostgreSQL connection string detected in ConnectionStrings:Postgres, DATABASE_URL, or POSTGRES_CONNECTION_STRING.");
 }
 
+await RegisterBotCommandsAsync(bot, logger);
+
 app.MapGet("/", () => Results.Ok("Telegram image bot is running."));
 app.MapGet("/health/db", async Task<IResult> (IServiceProvider services, CancellationToken cancellationToken) =>
 {
@@ -88,6 +90,16 @@ app.MapPost("/telegram/hook", async Task<IResult> (
 
     if (message.Document is null)
     {
+        if (IsHelpCommand(message.Text))
+        {
+            await bot.SendMessage(
+                chatId.Value,
+                BuildHelpMessage(),
+                cancellationToken: cancellationToken
+            );
+            return Results.Ok();
+        }
+
         if (IsStartSessionCommand(message.Text))
         {
             if (!captureSessionsEnabled)
@@ -462,6 +474,16 @@ static bool CanUseCaptureSessions(ICaptureSessionRepository? sessionRepository, 
     return sessionRepository is not null && imageRepository is not null;
 }
 
+static bool IsHelpCommand(string? text)
+{
+    if (string.IsNullOrWhiteSpace(text))
+        return false;
+
+    var command = text.Trim().Split(' ', 2, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+    return string.Equals(command, "/help", StringComparison.OrdinalIgnoreCase)
+        || command?.StartsWith("/help@", StringComparison.OrdinalIgnoreCase) == true;
+}
+
 static bool IsCloseSessionCommand(string? text)
 {
     if (string.IsNullOrWhiteSpace(text))
@@ -482,6 +504,49 @@ static bool IsStartSessionCommand(string? text)
     var command = text.Trim().Split(' ', 2, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
     return string.Equals(command, "/start_session", StringComparison.OrdinalIgnoreCase)
         || command?.StartsWith("/start_session@", StringComparison.OrdinalIgnoreCase) == true;
+}
+
+static string BuildHelpMessage()
+{
+    return """
+How to use this bot
+
+Single screenshot (default)
+1. Send one PNG file as a document (not as a photo).
+2. The bot saves it and auto-closes the session.
+
+Multiple screenshots (one schedule)
+1. Send /start_session
+2. Send PNG documents in order
+3. Send /close (or /done) when finished
+
+Commands
+/help - Show this guide
+/start_session - Start an explicit multi-image session
+/close - Close the current session
+/done - Alias for /close
+""";
+}
+
+static async Task RegisterBotCommandsAsync(ITelegramBotClient bot, ILogger logger, CancellationToken cancellationToken = default)
+{
+    var commands = new[]
+    {
+        new BotCommand { Command = "help", Description = "Show usage guide" },
+        new BotCommand { Command = "start_session", Description = "Start multi-image session" },
+        new BotCommand { Command = "close", Description = "Close current session" },
+        new BotCommand { Command = "done", Description = "Alias for /close" }
+    };
+
+    try
+    {
+        await bot.SetMyCommands(commands, cancellationToken: cancellationToken);
+        logger.LogInformation("Registered Telegram bot commands for UI menu.");
+    }
+    catch (Exception ex)
+    {
+        logger.LogWarning(ex, "Failed to register Telegram bot commands. Continuing without command menu update.");
+    }
 }
 
 static IAmazonS3 CreateS3Client(R2Settings settings)

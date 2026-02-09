@@ -150,6 +150,9 @@ As of now, the system implements **ONLY**:
   - at most one open session per user
   - images can be inserted only while their capture session state is `open`
 - Explicit multi-image grouping by active open capture session
+- Telegram command UX:
+  - command menu is registered on startup (`/help`, `/start_session`, `/close`, `/done`)
+  - `/help` returns an in-chat usage guide for single and multi-image flows
 - OCR dispatch coordination foundation:
   - background dispatcher claims at most one eligible session at a time (`closed` + at least one image)
   - claim transition is atomic (`closed -> processing`) to prevent duplicate workers claiming the same session
