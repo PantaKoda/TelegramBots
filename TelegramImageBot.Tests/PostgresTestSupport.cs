@@ -76,7 +76,8 @@ public sealed class PostgresRepositoryFixture : IAsyncLifetime
         {
             Path.Combine(repositoryRoot, "database", "001_schedule_ingest_schema.sql"),
             Path.Combine(repositoryRoot, "database", "002_capture_session_single_open_per_user.sql"),
-            Path.Combine(repositoryRoot, "database", "003_capture_image_require_open_session.sql")
+            Path.Combine(repositoryRoot, "database", "003_capture_image_require_open_session.sql"),
+            Path.Combine(repositoryRoot, "database", "004_schedule_notification.sql")
         };
 
         foreach (var scriptPath in scripts)

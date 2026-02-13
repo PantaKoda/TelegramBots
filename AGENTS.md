@@ -135,7 +135,7 @@ As of now, the system implements **ONLY**:
 - Accepts PNG screenshots sent as Telegram documents
 - Validates PNG format
 - Uploads images directly to Cloudflare R2
-- PostgreSQL schema bootstrap SQL (`database/001_schedule_ingest_schema.sql`, `database/002_capture_session_single_open_per_user.sql`, `database/003_capture_image_require_open_session.sql`)
+- PostgreSQL schema bootstrap SQL (`database/001_schedule_ingest_schema.sql`, `database/002_capture_session_single_open_per_user.sql`, `database/003_capture_image_require_open_session.sql`, `database/004_schedule_notification.sql`)
 - PostgreSQL C# runtime foundation:
   - connection string wiring (`ConnectionStrings:Postgres` or `DATABASE_URL`)
   - repository layer for `capture_session`, `capture_image`, `day_schedule`, `schedule_version`
