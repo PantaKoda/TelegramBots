@@ -130,7 +130,6 @@ internal interface ICaptureSessionRepository
     Task<CaptureSessionRecord> GetOrCreateOpenForUserAsync(long userId, CancellationToken cancellationToken = default);
     Task<CaptureSessionRecord?> GetOpenForUserAsync(long userId, CancellationToken cancellationToken = default);
     Task<CaptureSessionRecord?> CloseOpenForUserAsync(long userId, CancellationToken cancellationToken = default);
-    Task<CaptureSessionRecord?> ClaimNextClosedForProcessingAsync(CancellationToken cancellationToken = default);
     Task<CaptureSessionRecord?> GetByIdAsync(Guid sessionId, CancellationToken cancellationToken = default);
     Task<CaptureSessionRecord?> UpdateStateAsync(
         Guid sessionId,
@@ -279,38 +278,6 @@ internal sealed class CaptureSessionRepository(NpgsqlDataSource dataSource) : IC
 
         await using var command = dataSource.CreateCommand(sql);
         command.Parameters.AddWithValue("user_id", userId);
-
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        if (!await reader.ReadAsync(cancellationToken))
-            return null;
-
-        return MapCaptureSession(reader);
-    }
-
-    public async Task<CaptureSessionRecord?> ClaimNextClosedForProcessingAsync(CancellationToken cancellationToken = default)
-    {
-        const string sql = """
-            WITH candidate AS (
-                SELECT cs.id
-                FROM schedule_ingest.capture_session cs
-                WHERE cs.state = 'closed'::schedule_ingest.capture_session_state
-                  AND EXISTS (
-                      SELECT 1
-                      FROM schedule_ingest.capture_image ci
-                      WHERE ci.session_id = cs.id
-                  )
-                ORDER BY cs.closed_at ASC, cs.created_at ASC
-                LIMIT 1
-                FOR UPDATE SKIP LOCKED
-            )
-            UPDATE schedule_ingest.capture_session cs
-            SET state = 'processing'::schedule_ingest.capture_session_state
-            FROM candidate
-            WHERE cs.id = candidate.id
-            RETURNING cs.id, cs.user_id, cs.state, cs.created_at, cs.closed_at, cs.error;
-            """;
-
-        await using var command = dataSource.CreateCommand(sql);
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         if (!await reader.ReadAsync(cancellationToken))

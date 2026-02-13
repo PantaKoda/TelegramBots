@@ -12,7 +12,6 @@ var settings = LoadSettings(builder.Configuration);
 var postgresEnabled = builder.Services.AddSchedulePersistence(builder.Configuration);
 if (postgresEnabled)
 {
-    builder.Services.AddHostedService<CaptureSessionDispatcherService>();
     builder.Services.AddHostedService<ScheduleNotificationDispatcherService>();
 }
 
