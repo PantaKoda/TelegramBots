@@ -1,4 +1,5 @@
 using Npgsql;
+using NpgsqlTypes;
 using TelegramImageBot.Data;
 
 namespace TelegramImageBot.Tests;
@@ -10,7 +11,6 @@ public sealed class ScheduleNotificationRepositoryTests(PostgresRepositoryFixtur
     public async Task DispatchPendingAsync_WhenSendSucceeds_MarksRowsSent()
     {
         var userId = fixture.NextUserId();
-        await EnsureNotificationTableAsync();
         await CleanupNotificationsAsync(userId);
 
         try
@@ -50,7 +50,6 @@ public sealed class ScheduleNotificationRepositoryTests(PostgresRepositoryFixtur
     public async Task DispatchPendingAsync_WhenSendFails_MarksRowFailed()
     {
         var userId = fixture.NextUserId();
-        await EnsureNotificationTableAsync();
         await CleanupNotificationsAsync(userId);
 
         try
@@ -79,7 +78,6 @@ public sealed class ScheduleNotificationRepositoryTests(PostgresRepositoryFixtur
     public async Task DispatchPendingAsync_WhenConcurrentWorkersRun_DeliversAtMostOnce()
     {
         var userId = fixture.NextUserId();
-        await EnsureNotificationTableAsync();
         await CleanupNotificationsAsync(userId);
 
         try
@@ -128,25 +126,6 @@ public sealed class ScheduleNotificationRepositoryTests(PostgresRepositoryFixtur
         }
     }
 
-    private async Task EnsureNotificationTableAsync()
-    {
-        const string sql = """
-            CREATE TABLE IF NOT EXISTS schedule_ingest.schedule_notification (
-                id BIGSERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                message_text TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                status TEXT NOT NULL DEFAULT 'pending',
-                sent_at TIMESTAMPTZ NULL,
-                CONSTRAINT schedule_notification_status_chk
-                    CHECK (status IN ('pending', 'sent', 'failed'))
-            );
-            """;
-
-        await using var command = GetDataSource().CreateCommand(sql);
-        await command.ExecuteNonQueryAsync();
-    }
-
     private async Task CleanupNotificationsAsync(long userId)
     {
         const string sql = """
@@ -165,14 +144,39 @@ public sealed class ScheduleNotificationRepositoryTests(PostgresRepositoryFixtur
         DateTime? createdAt = null)
     {
         const string sql = """
-            INSERT INTO schedule_ingest.schedule_notification (user_id, message_text, created_at, status)
-            VALUES (@user_id, @message_text, @created_at, 'pending')
-            RETURNING id::text;
+            INSERT INTO schedule_ingest.schedule_notification (
+                notification_id,
+                user_id,
+                schedule_date,
+                source_session_id,
+                status,
+                notification_type,
+                message,
+                event_ids,
+                created_at
+            )
+            VALUES (
+                @notification_id,
+                @user_id,
+                @schedule_date,
+                @source_session_id,
+                'pending',
+                'summary',
+                @message,
+                @event_ids,
+                @created_at
+            )
+            RETURNING notification_id;
             """;
 
+        var notificationId = Guid.NewGuid().ToString("N");
         await using var command = GetDataSource().CreateCommand(sql);
+        command.Parameters.AddWithValue("notification_id", notificationId);
         command.Parameters.AddWithValue("user_id", userId);
-        command.Parameters.AddWithValue("message_text", messageText);
+        command.Parameters.AddWithValue("schedule_date", DateOnly.FromDateTime((createdAt ?? DateTime.UtcNow).Date));
+        command.Parameters.AddWithValue("source_session_id", Guid.NewGuid());
+        command.Parameters.AddWithValue("message", messageText);
+        command.Parameters.Add("event_ids", NpgsqlDbType.Jsonb).Value = "[]";
         command.Parameters.AddWithValue("created_at", createdAt ?? DateTime.UtcNow);
         var id = await command.ExecuteScalarAsync();
 
@@ -184,7 +188,7 @@ public sealed class ScheduleNotificationRepositoryTests(PostgresRepositoryFixtur
         const string sql = """
             SELECT status, sent_at
             FROM schedule_ingest.schedule_notification
-            WHERE id::text = @id;
+            WHERE notification_id = @id;
             """;
 
         await using var command = GetDataSource().CreateCommand(sql);
