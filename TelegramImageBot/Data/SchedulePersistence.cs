@@ -597,15 +597,15 @@ internal sealed class ScheduleNotificationRepository(NpgsqlDataSource dataSource
     {
         const string sql = """
             SELECT
-                id::text AS id,
+                notification_id AS id,
                 user_id,
-                message_text,
+                message AS message_text,
                 created_at,
                 status,
                 sent_at
             FROM schedule_ingest.schedule_notification
             WHERE status = 'pending'
-            ORDER BY created_at, id
+            ORDER BY created_at, notification_id
             LIMIT @batch_size
             FOR UPDATE SKIP LOCKED;
             """;
@@ -634,7 +634,7 @@ internal sealed class ScheduleNotificationRepository(NpgsqlDataSource dataSource
             UPDATE schedule_ingest.schedule_notification
             SET status = 'sent',
                 sent_at = now()
-            WHERE id::text = @id;
+            WHERE notification_id = @id;
             """;
 
         await using var command = new NpgsqlCommand(sql, connection, transaction);
@@ -656,7 +656,7 @@ internal sealed class ScheduleNotificationRepository(NpgsqlDataSource dataSource
         const string sql = """
             UPDATE schedule_ingest.schedule_notification
             SET status = 'failed'
-            WHERE id::text = @id;
+            WHERE notification_id = @id;
             """;
 
         await using var command = new NpgsqlCommand(sql, connection, transaction);
