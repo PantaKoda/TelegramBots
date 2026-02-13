@@ -13,10 +13,12 @@ var postgresEnabled = builder.Services.AddSchedulePersistence(builder.Configurat
 if (postgresEnabled)
 {
     builder.Services.AddHostedService<CaptureSessionDispatcherService>();
+    builder.Services.AddHostedService<ScheduleNotificationDispatcherService>();
 }
 
 var databaseTarget = ResolveDatabaseTarget(builder.Configuration);
 var bot = new TelegramBotClient(settings.BotToken);
+builder.Services.AddSingleton<ITelegramBotClient>(bot);
 var s3 = CreateS3Client(settings.R2);
 
 var app = builder.Build();
