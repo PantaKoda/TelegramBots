@@ -157,6 +157,10 @@ As of now, the system implements **ONLY**:
   - background dispatcher claims at most one eligible session at a time (`closed` + at least one image)
   - claim transition is atomic (`closed -> processing`) to prevent duplicate workers claiming the same session
   - dispatcher currently only claims/logs sessions and does not run OCR or mark `done`/`failed`
+- Notification delivery dispatcher:
+  - background worker polls `schedule_notification` for `pending` rows every few seconds
+  - pending rows are claimed with `FOR UPDATE SKIP LOCKED`, sent through Telegram, then marked `sent` or `failed`
+  - `message_text` is forwarded as-is (no formatting/parsing in C#), and delivered rows are never deleted
 
 The following are **NOT implemented**:
 

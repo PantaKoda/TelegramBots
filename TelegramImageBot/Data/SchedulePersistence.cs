@@ -18,6 +18,7 @@ internal static class SchedulePersistenceServiceCollectionExtensions
         services.AddScoped<ICaptureImageRepository, CaptureImageRepository>();
         services.AddScoped<IDayScheduleRepository, DayScheduleRepository>();
         services.AddScoped<IScheduleVersionRepository, ScheduleVersionRepository>();
+        services.AddScoped<IScheduleNotificationRepository, ScheduleNotificationRepository>();
 
         return true;
     }
@@ -108,6 +109,21 @@ internal sealed record ScheduleVersionRecord(
     DateTime CreatedAt
 );
 
+internal sealed record ScheduleNotificationRecord(
+    string Id,
+    long UserId,
+    string MessageText,
+    DateTime CreatedAt,
+    string Status,
+    DateTime? SentAt
+);
+
+internal sealed record ScheduleNotificationDispatchResult(
+    int ClaimedCount,
+    int SentCount,
+    int FailedCount
+);
+
 internal interface ICaptureSessionRepository
 {
     Task<CaptureSessionRecord> CreateAsync(long userId, CancellationToken cancellationToken = default);
@@ -161,6 +177,14 @@ internal interface IScheduleVersionRepository
     Task<IReadOnlyList<ScheduleVersionRecord>> ListByDayAsync(
         long userId,
         DateOnly scheduleDate,
+        CancellationToken cancellationToken = default);
+}
+
+internal interface IScheduleNotificationRepository
+{
+    Task<ScheduleNotificationDispatchResult> DispatchPendingAsync(
+        Func<ScheduleNotificationRecord, CancellationToken, Task> sendAsync,
+        int batchSize = 20,
         CancellationToken cancellationToken = default);
 }
 
@@ -514,6 +538,153 @@ internal sealed class CaptureImageRepository(NpgsqlDataSource dataSource) : ICap
             R2Key: reader.GetString(r2KeyOrdinal),
             TelegramMessageId: reader.IsDBNull(messageIdOrdinal) ? null : reader.GetInt64(messageIdOrdinal),
             CreatedAt: reader.GetDateTime(createdAtOrdinal)
+        );
+    }
+}
+
+internal sealed class ScheduleNotificationRepository(NpgsqlDataSource dataSource) : IScheduleNotificationRepository
+{
+    public async Task<ScheduleNotificationDispatchResult> DispatchPendingAsync(
+        Func<ScheduleNotificationRecord, CancellationToken, Task> sendAsync,
+        int batchSize = 20,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(sendAsync);
+
+        if (batchSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(batchSize), batchSize, "Batch size must be greater than zero.");
+
+        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+
+        var pendingBatch = await LockPendingBatchAsync(connection, transaction, batchSize, cancellationToken);
+        var sentCount = 0;
+        var failedCount = 0;
+
+        foreach (var notification in pendingBatch)
+        {
+            try
+            {
+                await sendAsync(notification, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch
+            {
+                await MarkFailedAsync(connection, transaction, notification.Id, cancellationToken);
+                failedCount++;
+                continue;
+            }
+
+            await MarkSentAsync(connection, transaction, notification.Id, cancellationToken);
+            sentCount++;
+        }
+
+        await transaction.CommitAsync(cancellationToken);
+        return new ScheduleNotificationDispatchResult(
+            ClaimedCount: pendingBatch.Count,
+            SentCount: sentCount,
+            FailedCount: failedCount);
+    }
+
+    private static async Task<IReadOnlyList<ScheduleNotificationRecord>> LockPendingBatchAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        int batchSize,
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+            SELECT
+                id::text AS id,
+                user_id,
+                message_text,
+                created_at,
+                status,
+                sent_at
+            FROM schedule_ingest.schedule_notification
+            WHERE status = 'pending'
+            ORDER BY created_at, id
+            LIMIT @batch_size
+            FOR UPDATE SKIP LOCKED;
+            """;
+
+        await using var command = new NpgsqlCommand(sql, connection, transaction);
+        command.Parameters.AddWithValue("batch_size", batchSize);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var notifications = new List<ScheduleNotificationRecord>();
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            notifications.Add(MapScheduleNotification(reader));
+        }
+
+        return notifications;
+    }
+
+    private static async Task MarkSentAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        string notificationId,
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+            UPDATE schedule_ingest.schedule_notification
+            SET status = 'sent',
+                sent_at = now()
+            WHERE id::text = @id;
+            """;
+
+        await using var command = new NpgsqlCommand(sql, connection, transaction);
+        command.Parameters.AddWithValue("id", notificationId);
+        var affected = await command.ExecuteNonQueryAsync(cancellationToken);
+        if (affected != 1)
+        {
+            throw new InvalidOperationException(
+                $"Expected to mark one notification as sent, but updated {affected} rows (id={notificationId}).");
+        }
+    }
+
+    private static async Task MarkFailedAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        string notificationId,
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+            UPDATE schedule_ingest.schedule_notification
+            SET status = 'failed'
+            WHERE id::text = @id;
+            """;
+
+        await using var command = new NpgsqlCommand(sql, connection, transaction);
+        command.Parameters.AddWithValue("id", notificationId);
+        var affected = await command.ExecuteNonQueryAsync(cancellationToken);
+        if (affected != 1)
+        {
+            throw new InvalidOperationException(
+                $"Expected to mark one notification as failed, but updated {affected} rows (id={notificationId}).");
+        }
+    }
+
+    private static ScheduleNotificationRecord MapScheduleNotification(NpgsqlDataReader reader)
+    {
+        var idOrdinal = reader.GetOrdinal("id");
+        var userIdOrdinal = reader.GetOrdinal("user_id");
+        var messageTextOrdinal = reader.GetOrdinal("message_text");
+        var createdAtOrdinal = reader.GetOrdinal("created_at");
+        var statusOrdinal = reader.GetOrdinal("status");
+        var sentAtOrdinal = reader.GetOrdinal("sent_at");
+
+        return new ScheduleNotificationRecord(
+            Id: reader.GetString(idOrdinal),
+            UserId: reader.GetInt64(userIdOrdinal),
+            MessageText: reader.GetString(messageTextOrdinal),
+            CreatedAt: reader.GetDateTime(createdAtOrdinal),
+            Status: reader.GetString(statusOrdinal),
+            SentAt: reader.IsDBNull(sentAtOrdinal) ? null : reader.GetDateTime(sentAtOrdinal)
         );
     }
 }
