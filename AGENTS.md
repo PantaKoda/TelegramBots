@@ -153,10 +153,10 @@ As of now, the system implements **ONLY**:
 - Telegram command UX:
   - command menu is registered on startup (`/help`, `/start_session`, `/close`, `/done`)
   - `/help` returns an in-chat usage guide for single and multi-image flows
-- OCR dispatch coordination foundation:
-  - background dispatcher claims at most one eligible session at a time (`closed` + at least one image)
-  - claim transition is atomic (`closed -> processing`) to prevent duplicate workers claiming the same session
-  - dispatcher currently only claims/logs sessions and does not run OCR or mark `done`/`failed`
+- Capture-session state ownership boundary:
+  - C# webhook flow owns only upload-time session lifecycle (`open` creation and `closed` transition)
+  - C# no longer claims sessions for OCR and does not transition sessions to `processing`
+  - closed/pending sessions are claimed and moved through processing lifecycle only by the Python OCR worker
 - Notification delivery dispatcher:
   - background worker polls `schedule_notification` for `pending` rows every few seconds
   - pending rows are claimed with `FOR UPDATE SKIP LOCKED`, sent through Telegram, then marked `sent` or `failed`
