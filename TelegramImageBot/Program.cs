@@ -91,6 +91,34 @@ app.MapPost("/telegram/hook", async Task<IResult> (
 
     if (message.Document is null)
     {
+        if (IsClearChatCommand(message.Text))
+        {
+            var deletedCount = await DeleteRecentChatMessagesAsync(
+                bot,
+                chatId.Value,
+                message.MessageId,
+                maxMessagesToDelete: 100,
+                cancellationToken);
+
+            logger.LogInformation(
+                "Processed /clear command. DeletedCount={DeletedCount}; UserId={UserId}; ChatId={ChatId}; AnchorMessageId={MessageId}",
+                deletedCount,
+                message.From.Id,
+                chatId.Value,
+                message.MessageId);
+
+            if (deletedCount == 0)
+            {
+                await bot.SendMessage(
+                    chatId.Value,
+                    "I could not clear messages in this chat. In groups, grant me delete permissions.",
+                    cancellationToken: cancellationToken
+                );
+            }
+
+            return Results.Ok();
+        }
+
         if (IsHelpCommand(message.Text))
         {
             await bot.SendMessage(
@@ -485,6 +513,16 @@ static bool IsHelpCommand(string? text)
         || command?.StartsWith("/help@", StringComparison.OrdinalIgnoreCase) == true;
 }
 
+static bool IsClearChatCommand(string? text)
+{
+    if (string.IsNullOrWhiteSpace(text))
+        return false;
+
+    var command = text.Trim().Split(' ', 2, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+    return string.Equals(command, "/clear", StringComparison.OrdinalIgnoreCase)
+        || command?.StartsWith("/clear@", StringComparison.OrdinalIgnoreCase) == true;
+}
+
 static bool IsCloseSessionCommand(string? text)
 {
     if (string.IsNullOrWhiteSpace(text))
@@ -523,6 +561,7 @@ Multiple screenshots (one schedule)
 
 Commands
 /help - Show this guide
+/clear - Delete recent chat messages
 /start_session - Start an explicit multi-image session
 /close - Close the current session
 /done - Alias for /close
@@ -534,6 +573,7 @@ static async Task RegisterBotCommandsAsync(ITelegramBotClient bot, ILogger logge
     var commands = new[]
     {
         new BotCommand { Command = "help", Description = "Show usage guide" },
+        new BotCommand { Command = "clear", Description = "Delete recent chat messages" },
         new BotCommand { Command = "start_session", Description = "Start multi-image session" },
         new BotCommand { Command = "close", Description = "Close current session" },
         new BotCommand { Command = "done", Description = "Alias for /close" }
@@ -579,6 +619,37 @@ static async Task<MemoryStream> DownloadFileAsync(ITelegramBotClient bot, string
     await bot.DownloadFile(file.FilePath, stream, cancellationToken);
     stream.Position = 0;
     return stream;
+}
+
+static async Task<int> DeleteRecentChatMessagesAsync(
+    ITelegramBotClient bot,
+    long chatId,
+    int anchorMessageId,
+    int maxMessagesToDelete,
+    CancellationToken cancellationToken)
+{
+    var boundedMax = Math.Clamp(maxMessagesToDelete, 1, 200);
+    var minMessageId = Math.Max(1, anchorMessageId - boundedMax + 1);
+    var deletedCount = 0;
+
+    for (var messageId = anchorMessageId; messageId >= minMessageId; messageId--)
+    {
+        try
+        {
+            await bot.DeleteMessage(chatId, messageId, cancellationToken: cancellationToken);
+            deletedCount++;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            // Ignore undeletable message IDs and continue best-effort cleanup.
+        }
+    }
+
+    return deletedCount;
 }
 
 static bool HasPngSignature(MemoryStream stream)

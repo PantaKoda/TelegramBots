@@ -151,8 +151,9 @@ As of now, the system implements **ONLY**:
   - images can be inserted only while their capture session state is `open`
 - Explicit multi-image grouping by active open capture session
 - Telegram command UX:
-  - command menu is registered on startup (`/help`, `/start_session`, `/close`, `/done`)
-  - `/help` returns an in-chat usage guide for single and multi-image flows
+  - command menu is registered on startup (`/help`, `/clear`, `/start_session`, `/close`, `/done`)
+  - `/help` returns an in-chat usage guide for single and multi-image flows, including `/clear`
+  - `/clear` performs best-effort deletion of recent chat messages in the current chat
 - Capture-session state ownership boundary:
   - C# webhook flow owns only upload-time session lifecycle (`open` creation and `closed` transition)
   - C# no longer claims sessions for OCR and does not transition sessions to `processing`
